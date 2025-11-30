@@ -1,161 +1,219 @@
-# Corrected app.py with updated fairness.compute_group_metrics integration
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 
-try:
-    import plotly.express as px
-    import plotly.graph_objects as go
-    PLOTLY_AVAILABLE = True
-except ImportError:
-    PLOTLY_AVAILABLE = False
-    px = None
-    go = None
+from backend.data_processing import prepare_dataset, apply_smote, apply_reweighing
+from backend.model_train import train_and_predict, evaluate_model
+from backend.fairness import compute_group_metrics
 
-st.set_page_config(page_title="AI Model Bias Detector", page_icon="🔍", layout="wide")
+st.set_page_config(layout="wide", page_title="AI Bias Detector (SMOTE + Reweighing)")
 
-try:
-    from backend import data_processing, model_train, fairness
-except ImportError as e:
-    import sys
-    error_msg = str(e)
-    python_path = sys.executable
-    st.error(f"Error: {error_msg}\nInstall missing packages.")
+st.title("AI Bias Detector — SMOTE & Reweighing")
+
+# Session state
+if "df" not in st.session_state:
+    st.session_state.df = None
+if "results" not in st.session_state:
+    st.session_state.results = None
+if "download_df" not in st.session_state:
+    st.session_state.download_df = None
+if "reweighted_df" not in st.session_state:
+    st.session_state.reweighted_df = None
+
+# Sidebar controls
+st.sidebar.header("Controls")
+uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
+use_sample = st.sidebar.checkbox("Use sample dataset (backend/sample_adult.csv)", value=False)
+
+if uploaded_file:
+    st.session_state.df = pd.read_csv(uploaded_file)
+elif use_sample:
+    try:
+        st.session_state.df = pd.read_csv("backend/sample_adult.csv")
+    except Exception:
+        st.sidebar.error("Sample dataset not found in backend/sample_adult.csv")
+        st.session_state.df = None
+
+df = st.session_state.df
+if df is None:
+    st.info("Upload a CSV dataset or enable the sample dataset to begin.")
     st.stop()
 
-st.title("🔍 AI Model Bias Detector")
+st.sidebar.markdown(f"Dataset: {df.shape[0]} rows × {df.shape[1]} cols")
 
-if 'df' not in st.session_state:
-    st.session_state.df = None
-if 'model' not in st.session_state:
-    st.session_state.model = None
-if 'preprocessed_data' not in st.session_state:
-    st.session_state.preprocessed_data = None
-if 'evaluation_results' not in st.session_state:
-    st.session_state.evaluation_results = None
-if 'fairness_results' not in st.session_state:
-    st.session_state.fairness_results = None
+cols = df.columns.tolist()
+# Target and sensitive selectors
+target_col = st.sidebar.selectbox("Target column (binary)", options=cols, index=len(cols)-1)
+# sensitive attribute candidates: prefer object type columns
+sensitive_candidates = [c for c in cols if df[c].dtype == 'object']
+if not sensitive_candidates:
+    sensitive_candidates = cols
+sensitive_col = st.sidebar.selectbox("Sensitive attribute (categorical)", options=sensitive_candidates)
 
-st.sidebar.header("📁 Dataset Upload")
-uploaded_file = st.sidebar.file_uploader("Choose a CSV file", type=['csv'])
+# Model selection
+model_map = {
+    "Logistic Regression": "logistic",
+    "Random Forest": "random_forest",
+    "SVM": "svm",
+    "Decision Tree": "decision_tree"
+}
+model_choice_display = st.sidebar.selectbox("Select model", list(model_map.keys()))
+model_choice = model_map[model_choice_display]
 
-if uploaded_file is not None:
+# Mitigation selection
+mitigation_choice = st.sidebar.selectbox("Bias mitigation method", ["None", "SMOTE", "Reweighing"])
+
+# SMOTE params
+smote_k = st.sidebar.number_input("SMOTE k_neighbors", min_value=1, max_value=20, value=5)
+
+# Train/test split
+test_size = st.sidebar.slider("Test set size", 0.10, 0.40, 0.20, 0.05)
+
+# Train button
+if st.sidebar.button("Train & Analyze"):
     try:
-        df = pd.read_csv(uploaded_file)
-        st.session_state.df = df
-        st.sidebar.success(f"Dataset loaded! {len(df)} rows.")
+        prepared = prepare_dataset(df, target_col=target_col, sensitive_col=sensitive_col, test_size=test_size)
     except Exception as e:
-        st.sidebar.error(f"Error: {str(e)}")
+        st.error(f"Dataset preparation failed: {e}")
+        st.stop()
 
-if st.session_state.df is not None:
-    df = st.session_state.df
+    X_train = prepared["X_train"]
+    X_test = prepared["X_test"]
+    y_train = prepared["y_train"]
+    y_test = prepared["y_test"]
+    s_train = prepared["s_train"]
+    s_test = prepared["s_test"]
+    df_clean = prepared["df_clean"]
 
-    st.header("📊 Dataset Overview")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total Rows", len(df))
-    col2.metric("Columns", len(df.columns))
-    col3.metric("Missing Values", df.isnull().sum().sum())
+    st.session_state.df_clean = df_clean
 
-    st.subheader("Preview")
-    st.dataframe(df.head(), use_container_width=True)
+    # default values
+    sample_weights = None
+    X_train_used = X_train.copy()
+    y_train_used = y_train.copy()
 
-    st.header("⚙️ Configuration")
-    col1, col2 = st.columns(2)
+    if mitigation_choice == "SMOTE":
+        st.info("Applying SMOTE to training set...")
+        X_train_used, y_train_used = apply_smote(X_train, y_train, k_neighbors=int(smote_k))
+        st.session_state.download_df = pd.concat([X_train_used.reset_index(drop=True), pd.Series(y_train_used, name=target_col).reset_index(drop=True)], axis=1)
+        st.session_state.reweighted_df = None
 
-    with col1:
-        target_col = st.selectbox("Select Target Column", df.columns.tolist())
-    with col2:
-        protected_col = st.selectbox("Select Protected Attribute", [c for c in df.columns if c != target_col])
+    elif mitigation_choice == "Reweighing":
+        st.info("Computing reweighing sample weights...")
+        sample_weights = apply_reweighing(y_train, s_train)
+        # For user download offer reweighted dataset (original X_train + y_train + sample_weight)
+        reweighted_download = pd.concat([X_train.reset_index(drop=True),
+                                         pd.Series(y_train, name=target_col).reset_index(drop=True),
+                                         sample_weights.reset_index(drop=True)], axis=1)
+        st.session_state.reweighted_df = reweighted_download
+        st.session_state.download_df = None
 
-    st.header("🚀 Actions")
-    col1, col2, col3, col4 = st.columns(4)
+    else:
+        st.session_state.download_df = None
+        st.session_state.reweighted_df = None
 
-    with col1:
-        preprocess_btn = st.button("🔄 Preprocess")
-    with col2:
-        train_btn = st.button("🏋️ Train", disabled=st.session_state.preprocessed_data is None)
-    with col3:
-        evaluate_btn = st.button("📊 Evaluate", disabled=st.session_state.model is None)
-    with col4:
-        fairness_btn = st.button("⚖️ Fairness", disabled=st.session_state.model is None)
+    # Train model: if reweighing, pass sample_weight; if smote already applied sample_weight=None
+    model, y_pred, y_proba = train_and_predict(model_choice, X_train_used, y_train_used, X_test, sample_weight=sample_weights)
 
-    if preprocess_btn:
-        try:
-            X_train, X_test, y_train, y_test, encoded_df = data_processing.preprocess_data(df, target_col)
-            st.session_state.preprocessed_data = {
-                'X_train': X_train,
-                'X_test': X_test,
-                'y_train': y_train,
-                'y_test': y_test,
-                'encoded_df': encoded_df
-            }
-            st.success("Preprocessing complete!")
-        except Exception as e:
-            st.error(f"Error: {str(e)}")
+    # Evaluate
+    acc, report = evaluate_model(y_test, y_pred)
+    metrics = compute_group_metrics(y_test, y_pred, s_test)
 
-    if train_btn:
-        try:
-            pdata = st.session_state.preprocessed_data
-            model = model_train.train_model(pdata['X_train'], pdata['y_train'])
-            st.session_state.model = model
-            st.success("Model trained!")
-        except Exception as e:
-            st.error(f"Error: {str(e)}")
+    # Save to session_state
+    st.session_state.results = {
+        "model": model,
+        "X_test": X_test,
+        "y_test": y_test,
+        "y_pred": y_pred,
+        "y_proba": y_proba,
+        "accuracy": acc,
+        "report": report,
+        "fairness": metrics,
+        "mitigation": mitigation_choice,
+        "sample_weights": sample_weights
+    }
 
-    if evaluate_btn:
-        try:
-            pdata = st.session_state.preprocessed_data
-            accuracy, report = model_train.evaluate_model(
-                st.session_state.model, pdata['X_test'], pdata['y_test']
-            )
-            st.session_state.evaluation_results = {'accuracy': accuracy, 'report': report}
-            st.success("Evaluation complete!")
-        except Exception as e:
-            st.error(f"Error: {str(e)}")
+# If no results yet
+if st.session_state.results is None:
+    st.info("Train a model to see metrics.")
+    st.stop()
 
-    if st.session_state.evaluation_results is not None:
-        st.header("📊 Evaluation Results")
-        res = st.session_state.evaluation_results
-        st.metric("Accuracy", f"{res['accuracy']:.4f}")
-        st.text_area("Classification Report", res['report'], height=300)
+# Display results
+res = st.session_state.results
+st.header("Model performance")
+st.write(f"Model: **{model_choice_display}**")
+st.write(f"Mitigation: **{res['mitigation']}**")
+st.write(f"Accuracy: **{res['accuracy']:.4f}**")
+st.text(res["report"])
 
-    # ---- FIXED FAIRNESS SECTION ----
-    if fairness_btn:
-        try:
-            pdata = st.session_state.preprocessed_data
-            y_test = pdata['y_test']
-            X_test = pdata['X_test']
-            model = st.session_state.model
+st.header("Fairness metrics")
+metrics = res["fairness"]
+metric_df = pd.DataFrame({
+    "Metric": [
+        "Demographic Parity Difference",
+        "Equal Opportunity Difference",
+        "Equalized Odds Difference",
+        "Disparate Impact Ratio",
+        "Predictive Parity Difference"
+    ],
+    "Value": [
+        metrics["demographic_parity_difference"],
+        metrics["equal_opportunity_difference"],
+        metrics["equalized_odds_difference"],
+        metrics["disparate_impact_ratio"],
+        metrics["predictive_parity_difference"]
+    ]
+})
+st.dataframe(metric_df.style.format({"Value": "{:.4f}"}))
 
-            # Predictions
-            y_pred = model.predict(X_test)
+st.header("Group-level metrics")
+st.dataframe(metrics["group_metrics"].sort_values(by="count", ascending=False).reset_index(drop=True))
 
-            # Protected feature values (original df aligned to test index)
-            protected_test = df.loc[X_test.index, protected_col]
+# Visualizations
+gm = metrics["group_metrics"].set_index("group")
+fig1, ax1 = plt.subplots(figsize=(6,3))
+gm["positive_prediction_rate"].plot(kind="bar", ax=ax1)
+ax1.set_title("Positive Prediction Rate (PPR) per group")
+st.pyplot(fig1)
 
-            dp_diff, eo_diff, metrics_df = fairness.compute_group_metrics(
-                y_test, y_pred, protected_test
-            )
+fig2, ax2 = plt.subplots(figsize=(6,3))
+gm["true_positive_rate"].plot(kind="bar", ax=ax2)
+ax2.set_title("True Positive Rate (TPR) per group")
+st.pyplot(fig2)
 
-            st.session_state.fairness_results = {
-                'demographic_parity_diff': dp_diff,
-                'equal_opportunity_diff': eo_diff,
-                'metrics_df': metrics_df
-            }
+fig3, ax3 = plt.subplots(figsize=(6,3))
+gm["false_positive_rate"].plot(kind="bar", ax=ax3)
+ax3.set_title("False Positive Rate (FPR) per group")
+st.pyplot(fig3)
 
-            st.success("Fairness analysis complete!")
-        except Exception as e:
-            st.error(f"Error during fairness analysis: {str(e)}")
+# Warnings
+if res["accuracy"] < 0.7:
+    st.warning("Low accuracy (<0.7). Fairness metrics may be unreliable.")
+small_groups = metrics["group_metrics"][metrics["group_metrics"]["count"] < 50]
+if not small_groups.empty:
+    st.warning(f"Small sensitive groups detected (count < 50): {list(small_groups['group'])}")
 
-    if st.session_state.fairness_results is not None:
-        st.header("⚖️ Fairness Results")
+# Downloads
+st.header("Downloads")
+if st.session_state.download_df is not None:
+    csv_res = st.session_state.download_df.to_csv(index=False).encode('utf-8')
+    st.download_button("Download SMOTE-resampled training CSV", data=csv_res, file_name="resampled_dataset.csv", mime="text/csv", key="dl_smote")
 
-        fr = st.session_state.fairness_results
-        col1, col2 = st.columns(2)
-        col1.metric("Demographic Parity Diff", f"{fr['demographic_parity_diff']:.4f}")
-        col2.metric("Equal Opportunity Diff", f"{fr['equal_opportunity_diff']:.4f}")
+if st.session_state.reweighted_df is not None:
+    csv_rw = st.session_state.reweighted_df.to_csv(index=False).encode('utf-8')
+    st.download_button("Download reweighted training CSV (with sample_weight)", data=csv_rw, file_name="reweighted_dataset.csv", mime="text/csv", key="dl_rw")
 
-        st.subheader("Per-group metrics")
-        st.dataframe(fr['metrics_df'], use_container_width=True)
-else:
-    st.info("Upload a dataset to begin.")
+# Download predictions
+out = res["X_test"].copy()
+out[target_col] = res["y_test"].values
+out["y_pred"] = res["y_pred"].values
+try:
+    out["y_proba"] = res["y_proba"].values
+except:
+    pass
+csv_out = out.to_csv(index=False).encode('utf-8')
+st.download_button("Download test predictions CSV", data=csv_out, file_name="predictions.csv", mime="text/csv", key="dl_preds")
+
+st.success("Analysis complete.")

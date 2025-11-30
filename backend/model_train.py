@@ -1,68 +1,100 @@
-"""
-Model training module for training and evaluating machine learning models.
-
-This module handles model training using logistic regression and provides
-evaluation metrics including accuracy and classification reports.
-"""
-
-import pandas as pd
+# backend/model_train.py
 import numpy as np
+import pandas as pd
 
-# Import sklearn modules with error handling
-try:
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.metrics import accuracy_score, classification_report
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    SKLEARN_AVAILABLE = False
-    raise ImportError(
-        "scikit-learn is not installed. Please install it using: pip install scikit-learn\n"
-        "Or install all requirements: pip install -r requirements.txt"
-    )
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, classification_report
+
+from typing import Tuple, Optional
+
+RANDOM_STATE = 42
 
 
-def train_model(X_train, y_train):
+def get_model(name: str):
+    name = name.lower()
+    if name == "logistic":
+        # Increased max_iter and using robust settings
+        return LogisticRegression(
+            max_iter=5000,
+            solver='lbfgs',
+            random_state=RANDOM_STATE
+        )
+
+    if name == "random_forest":
+        return RandomForestClassifier(n_estimators=100, random_state=RANDOM_STATE)
+
+    if name == "svm":
+        # SVM requires scaling; handled below
+        return SVC(probability=True, random_state=RANDOM_STATE)
+
+    if name == "decision_tree":
+        return DecisionTreeClassifier(random_state=RANDOM_STATE)
+
+    raise ValueError(f"Unknown model name '{name}'")
+
+
+def train_and_predict(
+    model_name: str,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    sample_weight: Optional[pd.Series] = None
+) -> Tuple[object, pd.Series, pd.Series]:
     """
-    Train a logistic regression model on the training data.
-    
-    Args:
-        X_train (pd.DataFrame or np.ndarray): Training features
-        y_train (pd.Series or np.ndarray): Training target labels
-        
-    Returns:
-        sklearn.linear_model.LogisticRegression: Trained logistic regression model
+    Train the chosen model and return (trained_model, y_pred, y_proba)
+    Automatically scales the data for Logistic Regression and SVM.
     """
-    # Initialize logistic regression model
-    # Using max_iter=1000 to ensure convergence for complex datasets
-    model = LogisticRegression(max_iter=1000, random_state=42, solver='lbfgs')
-    
-    # Train the model
-    model.fit(X_train, y_train)
-    
-    return model
+    model = get_model(model_name)
+
+    # ------------------------------
+    # SCALE FEATURES for models that need it
+    # ------------------------------
+    needs_scaling = model_name in ["logistic", "svm"]
+
+    if needs_scaling:
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+    else:
+        X_train_scaled = X_train
+        X_test_scaled = X_test
+
+    # ------------------------------
+    # Model Training
+    # ------------------------------
+    if sample_weight is None:
+        model.fit(X_train_scaled, y_train)
+    else:
+        # model.fit accepts sample_weight in most sklearn models
+        model.fit(X_train_scaled, y_train, sample_weight=sample_weight.values)
+
+    # ------------------------------
+    # Predictions
+    # ------------------------------
+    y_pred = pd.Series(model.predict(X_test_scaled), index=X_test.index, name='y_pred')
+
+    # compute probabilities when possible
+    try:
+        y_proba = pd.Series(model.predict_proba(X_test_scaled)[:, 1],
+                            index=X_test.index, name='y_proba')
+    except Exception:
+        # fallback using decision function or predicted labels
+        try:
+            decision = model.decision_function(X_test_scaled)
+            probs = 1 / (1 + np.exp(-decision))
+            y_proba = pd.Series(probs, index=X_test.index, name='y_proba')
+        except Exception:
+            y_proba = pd.Series(y_pred.astype(float), index=X_test.index, name='y_proba')
+
+    return model, y_pred, y_proba
 
 
-def evaluate_model(model, X_test, y_test):
-    """
-    Evaluate the trained model on test data.
-    
-    Args:
-        model: Trained machine learning model (e.g., LogisticRegression)
-        X_test (pd.DataFrame or np.ndarray): Testing features
-        y_test (pd.Series or np.ndarray): Testing target labels
-        
-    Returns:
-        tuple: A tuple containing:
-            - accuracy (float): Model accuracy score
-            - classification_report (str): Detailed classification report
-    """
-    # Make predictions on test set
-    y_pred = model.predict(X_test)
-    
-    # Calculate accuracy
-    accuracy = accuracy_score(y_test, y_pred)
-    
-    # Generate classification report
+def evaluate_model(y_test: pd.Series, y_pred: pd.Series):
+    acc = accuracy_score(y_test, y_pred)
     report = classification_report(y_test, y_pred, output_dict=False)
-    
-    return accuracy, report
+    return acc, report
