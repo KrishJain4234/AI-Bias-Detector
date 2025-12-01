@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import plotly.express as px  # NEW
 
 from backend.data_processing import prepare_dataset, apply_smote, apply_reweighing
 from backend.model_train import train_and_predict, evaluate_model
@@ -97,13 +98,13 @@ if st.sidebar.button("Train & Analyze"):
     if mitigation_choice == "SMOTE":
         st.info("Applying SMOTE to training set...")
         X_train_used, y_train_used = apply_smote(X_train, y_train, k_neighbors=int(smote_k))
-        st.session_state.download_df = pd.concat([X_train_used.reset_index(drop=True), pd.Series(y_train_used, name=target_col).reset_index(drop=True)], axis=1)
+        st.session_state.download_df = pd.concat([X_train_used.reset_index(drop=True),
+                                                  pd.Series(y_train_used, name=target_col).reset_index(drop=True)], axis=1)
         st.session_state.reweighted_df = None
 
     elif mitigation_choice == "Reweighing":
         st.info("Computing reweighing sample weights...")
         sample_weights = apply_reweighing(y_train, s_train)
-        # For user download offer reweighted dataset (original X_train + y_train + sample_weight)
         reweighted_download = pd.concat([X_train.reset_index(drop=True),
                                          pd.Series(y_train, name=target_col).reset_index(drop=True),
                                          sample_weights.reset_index(drop=True)], axis=1)
@@ -114,14 +115,15 @@ if st.sidebar.button("Train & Analyze"):
         st.session_state.download_df = None
         st.session_state.reweighted_df = None
 
-    # Train model: if reweighing, pass sample_weight; if smote already applied sample_weight=None
-    model, y_pred, y_proba = train_and_predict(model_choice, X_train_used, y_train_used, X_test, sample_weight=sample_weights)
+    # Train model
+    model, y_pred, y_proba = train_and_predict(
+        model_choice, X_train_used, y_train_used, X_test, sample_weight=sample_weights
+    )
 
     # Evaluate
     acc, report = evaluate_model(y_test, y_pred)
     metrics = compute_group_metrics(y_test, y_pred, s_test)
 
-    # Save to session_state
     st.session_state.results = {
         "model": model,
         "X_test": X_test,
@@ -146,8 +148,20 @@ st.header("Model performance")
 st.write(f"Model: **{model_choice_display}**")
 st.write(f"Mitigation: **{res['mitigation']}**")
 st.write(f"Accuracy: **{res['accuracy']:.4f}**")
-st.text(res["report"])
 
+# -------------------------------
+# CLEAN CLASSIFICATION REPORT TABLE
+# -------------------------------
+from sklearn.metrics import classification_report
+
+report_dict = classification_report(res["y_test"], res["y_pred"], output_dict=True)
+report_df = pd.DataFrame(report_dict).transpose()
+st.subheader("Classification Report")
+st.dataframe(report_df.style.format("{:.3f}"), use_container_width=True)
+
+# -------------------------------
+# FAIRNESS METRICS TABLE
+# -------------------------------
 st.header("Fairness metrics")
 metrics = res["fairness"]
 metric_df = pd.DataFrame({
@@ -168,30 +182,97 @@ metric_df = pd.DataFrame({
 })
 st.dataframe(metric_df.style.format({"Value": "{:.4f}"}))
 
+# -------------------------------
+# GROUP METRICS TABLE
+# -------------------------------
 st.header("Group-level metrics")
-st.dataframe(metrics["group_metrics"].sort_values(by="count", ascending=False).reset_index(drop=True))
+gm = metrics["group_metrics"].copy()
+st.dataframe(gm.sort_values(by="count", ascending=False).reset_index(drop=True))
 
-# Visualizations
-gm = metrics["group_metrics"].set_index("group")
-fig1, ax1 = plt.subplots(figsize=(6,3))
-gm["positive_prediction_rate"].plot(kind="bar", ax=ax1)
-ax1.set_title("Positive Prediction Rate (PPR) per group")
-st.pyplot(fig1)
+# -------------------------------
+# FIXED & IMPROVED GRAPH SECTION
+# -------------------------------
 
-fig2, ax2 = plt.subplots(figsize=(6,3))
-gm["true_positive_rate"].plot(kind="bar", ax=ax2)
-ax2.set_title("True Positive Rate (TPR) per group")
-st.pyplot(fig2)
+st.header("Visualizations")
 
-fig3, ax3 = plt.subplots(figsize=(6,3))
-gm["false_positive_rate"].plot(kind="bar", ax=ax3)
-ax3.set_title("False Positive Rate (FPR) per group")
-st.pyplot(fig3)
+# 1️⃣ Positive Prediction Rate — Proper Scaling
+y_min = gm["positive_prediction_rate"].min() * 0.8
+y_max = gm["positive_prediction_rate"].max() * 1.2
+
+fig_ppr = px.bar(
+    gm,
+    x="group",
+    y="positive_prediction_rate",
+    text="positive_prediction_rate",
+    color="positive_prediction_rate",
+    color_continuous_scale="Blues",
+    title="Positive Prediction Rate (PPR) per group",
+)
+fig_ppr.update_traces(
+    texttemplate="%{text:.3f}",
+    textposition="outside",
+    marker=dict(line=dict(width=1, color="black"))
+)
+fig_ppr.update_layout(yaxis=dict(range=[y_min, y_max]), height=450)
+st.plotly_chart(fig_ppr, use_container_width=True)
+
+# 2️⃣ True Positive Rate — Proper Scaling
+y_min = gm["true_positive_rate"].min() * 0.8
+y_max = gm["true_positive_rate"].max() * 1.2
+
+fig_tpr = px.bar(
+    gm,
+    x="group",
+    y="true_positive_rate",
+    text="true_positive_rate",
+    color="true_positive_rate",
+    color_continuous_scale="Greens",
+    title="True Positive Rate (TPR) per group",
+)
+fig_tpr.update_traces(
+    texttemplate="%{text:.3f}",
+    textposition="outside",
+    marker=dict(line=dict(width=1, color="black"))
+)
+fig_tpr.update_layout(yaxis=dict(range=[y_min, y_max]), height=450)
+st.plotly_chart(fig_tpr, use_container_width=True)
+
+# 3️⃣ False Positive Rate — Proper Scaling
+y_min = gm["false_positive_rate"].min() * 0.8
+y_max = gm["false_positive_rate"].max() * 1.2
+
+fig_fpr = px.bar(
+    gm,
+    x="group",
+    y="false_positive_rate",
+    text="false_positive_rate",
+    color="false_positive_rate",
+    color_continuous_scale="Reds",
+    title="False Positive Rate (FPR) per group",
+)
+fig_fpr.update_traces(
+    texttemplate="%{text:.3f}",
+    textposition="outside",
+    marker=dict(line=dict(width=1, color="black"))
+)
+fig_fpr.update_layout(yaxis=dict(range=[y_min, y_max]), height=450)
+st.plotly_chart(fig_fpr, use_container_width=True)
+
+# 4️⃣ Pie chart
+fig_pie = px.pie(
+    gm,
+    names="group",
+    values="count",
+    title="Sensitive Group Distribution",
+    hole=0.35
+)
+fig_pie.update_traces(textinfo="percent+label")
+st.plotly_chart(fig_pie, use_container_width=True)
 
 # Warnings
 if res["accuracy"] < 0.7:
     st.warning("Low accuracy (<0.7). Fairness metrics may be unreliable.")
-small_groups = metrics["group_metrics"][metrics["group_metrics"]["count"] < 50]
+small_groups = gm[gm["count"] < 50]
 if not small_groups.empty:
     st.warning(f"Small sensitive groups detected (count < 50): {list(small_groups['group'])}")
 
@@ -199,13 +280,14 @@ if not small_groups.empty:
 st.header("Downloads")
 if st.session_state.download_df is not None:
     csv_res = st.session_state.download_df.to_csv(index=False).encode('utf-8')
-    st.download_button("Download SMOTE-resampled training CSV", data=csv_res, file_name="resampled_dataset.csv", mime="text/csv", key="dl_smote")
+    st.download_button("Download SMOTE-resampled training CSV", data=csv_res,
+                       file_name="resampled_dataset.csv", mime="text/csv")
 
 if st.session_state.reweighted_df is not None:
     csv_rw = st.session_state.reweighted_df.to_csv(index=False).encode('utf-8')
-    st.download_button("Download reweighted training CSV (with sample_weight)", data=csv_rw, file_name="reweighted_dataset.csv", mime="text/csv", key="dl_rw")
+    st.download_button("Download reweighted training CSV (with sample_weight)", data=csv_rw,
+                       file_name="reweighted_dataset.csv", mime="text/csv")
 
-# Download predictions
 out = res["X_test"].copy()
 out[target_col] = res["y_test"].values
 out["y_pred"] = res["y_pred"].values
@@ -214,6 +296,7 @@ try:
 except:
     pass
 csv_out = out.to_csv(index=False).encode('utf-8')
-st.download_button("Download test predictions CSV", data=csv_out, file_name="predictions.csv", mime="text/csv", key="dl_preds")
+st.download_button("Download test predictions CSV", data=csv_out,
+                   file_name="predictions.csv", mime="text/csv")
 
 st.success("Analysis complete.")
